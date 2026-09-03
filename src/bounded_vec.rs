@@ -184,7 +184,7 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
     /// # Leaking
     ///
     /// If the returned iterator goes out of scope without being dropped (due to
-    /// [`mem::forget`], for example), the vector may have lost and leaked
+    /// [`core::mem::forget`], for example), the vector may have lost and leaked
     /// elements arbitrarily, including elements outside the range.
     ///
     /// # Examples
@@ -522,12 +522,12 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
 
 /// A non-empty Vec with no effective upper-bound on its length.
 /// Lenght is bounded to `u32::MAX``
-#[cfg(any(feature = "schemars", feature = "borsh"))]
+#[cfg(any(feature = "schemars", feature = "borsh", feature = "borsh_schema"))]
 pub type NonEmptyVec<T> =
     BoundedVec<T, 1, { u32::MAX as usize }, witnesses::NonEmpty<1, { u32::MAX as usize }>>;
 
 /// A non-empty Vec with no effective upper-bound on its length
-#[cfg(not(any(feature = "schemars", feature = "borsh")))]
+#[cfg(not(any(feature = "schemars", feature = "borsh", feature = "borsh_schema")))]
 pub type NonEmptyVec<T> = BoundedVec<T, 1, { usize::MAX }, witnesses::NonEmpty<1, { usize::MAX }>>;
 
 /// Possibly empty Vec with upper-bound on its length
@@ -626,9 +626,9 @@ impl<T, const L: usize, const U: usize, W> AsMut<[T]> for BoundedVec<T, L, U, W>
     }
 }
 
-/// Option<BoundedVec<T, _, _>> to Vec<T>
+/// `Option<BoundedVec<T, _, _>>` to `Vec<T>`
 pub trait OptBoundedVecToVec<T> {
-    /// Option<BoundedVec<T, _, _>> to Vec<T>
+    /// `Option<BoundedVec<T, _, _>>` to `Vec<T>`
     fn to_vec(self) -> Vec<T>;
 }
 
@@ -649,16 +649,16 @@ impl<T, const U: usize> From<BoundedVec<T, 0, U>> for EmptyBoundedVec<T, U> {
     }
 }
 
-/// Suports encoding and decoding with [borsh](https://crates.io/crates/borsh), and BorshSchema.
+/// Supports encoding and decoding with [borsh](https://crates.io/crates/borsh).
+/// BorshSchema is supported behind the `borsh_schema` feature.
 ///
 /// By default Borsh uses u32 as length prefix for sequences.
 /// For bounded we used u8, u16 or u32 depending on the U.
-/// Increase or decreaasing U may not always be backward compatible.
+/// Increase or decreasing U may not always be backward compatible.
 #[cfg(feature = "borsh")]
 mod borsh_impl {
     use super::*;
-    use alloc::collections::btree_map::{BTreeMap, Entry};
-    use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
+    use borsh::{BorshDeserialize, BorshSerialize};
 
     impl<T: BorshSerialize, const L: usize, const U: usize, W> BorshSerialize
         for BoundedVec<T, L, U, W>
@@ -695,58 +695,67 @@ mod borsh_impl {
         }
     }
 
+    fn read_items<T: BorshDeserialize, const U: usize, R: borsh::io::Read>(
+        reader: &mut R,
+        min_len: usize,
+    ) -> borsh::io::Result<Vec<T>> {
+        let len = if U <= usize::from(u8::MAX) {
+            usize::from(u8::deserialize_reader(reader)?)
+        } else if U <= usize::from(u16::MAX) {
+            usize::from(u16::deserialize_reader(reader)?)
+        } else {
+            let len = u32::deserialize_reader(reader)?;
+            usize::try_from(len).map_err(|_| {
+                borsh::io::Error::new(
+                    borsh::io::ErrorKind::Other,
+                    alloc::format!("Length overflow: got {len}"),
+                )
+            })?
+        };
+        if len < min_len {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::Other,
+                alloc::format!("Lower bound violation: got {len} (expected >= {min_len})"),
+            ));
+        } else if len > U {
+            return Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::Other,
+                alloc::format!("Upper bound violation: got {len} (expected <= {U})"),
+            ));
+        }
+        // adapted from internals for borsh-rs
+        let data = if len == 0 {
+            Vec::new()
+        } else if let Some(vec_bytes) = T::vec_from_reader(len as u32, reader)? {
+            vec_bytes
+        } else {
+            let el_size = core::mem::size_of::<T>() as u32;
+            let cautious = core::cmp::max(core::cmp::min(len as u32, 4096 / el_size), 1) as usize;
+
+            // TODO(16): return capacity allocation when we can safely do that.
+            let mut result = Vec::with_capacity(cautious);
+            for _ in 0..len {
+                result.push(T::deserialize_reader(reader)?);
+            }
+            result
+        };
+
+        Ok(data)
+    }
+
     impl<T: BorshDeserialize, const U: usize> BorshDeserialize for EmptyBoundedVec<T, U> {
         fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-            Ok(Self::from(BoundedVec::<T, 0, U>::deserialize_reader(
-                reader,
-            )?))
+            let data = read_items::<T, U, R>(reader, 0)?;
+            Ok(Self {
+                inner: data,
+                witness: witnesses::empty(),
+            })
         }
     }
 
     impl<T: BorshDeserialize, const L: usize, const U: usize> BorshDeserialize for BoundedVec<T, L, U> {
         fn deserialize_reader<R: borsh::io::Read>(reader: &mut R) -> borsh::io::Result<Self> {
-            let len = if U <= usize::from(u8::MAX) {
-                usize::from(u8::deserialize_reader(reader)?)
-            } else if U <= usize::from(u16::MAX) {
-                usize::from(u16::deserialize_reader(reader)?)
-            } else {
-                let len = u32::deserialize_reader(reader)?;
-                usize::try_from(len).map_err(|_| {
-                    borsh::io::Error::new(
-                        borsh::io::ErrorKind::Other,
-                        alloc::format!("Length overflow: got {len}"),
-                    )
-                })?
-            };
-            if len < L {
-                return Err(borsh::io::Error::new(
-                    borsh::io::ErrorKind::Other,
-                    alloc::format!("Lower bound violation: got {len} (expected >= {L})"),
-                ));
-            } else if len > U {
-                return Err(borsh::io::Error::new(
-                    borsh::io::ErrorKind::Other,
-                    alloc::format!("Upper bound violation: got {len} (expected <= {U})"),
-                ));
-            }
-            // adapted from internals for borsh-rs
-            let data = if len == 0 {
-                Vec::new()
-            } else if let Some(vec_bytes) = T::vec_from_reader(len as u32, reader)? {
-                vec_bytes
-            } else {
-                let el_size = core::mem::size_of::<T>() as u32;
-                let cautious =
-                    core::cmp::max(core::cmp::min(len as u32, 4096 / el_size), 1) as usize;
-
-                // TODO(16): return capacity allocation when we can safely do that.
-                let mut result = Vec::with_capacity(cautious);
-                for _ in 0..len {
-                    result.push(T::deserialize_reader(reader)?);
-                }
-                result
-            };
-
+            let data = read_items::<T, U, R>(reader, L)?;
             Ok(Self {
                 inner: data,
                 witness: witnesses::non_empty(),
@@ -754,46 +763,53 @@ mod borsh_impl {
         }
     }
 
-    impl<T: BorshSchema, const L: usize, const U: usize, W> BorshSchema for BoundedVec<T, L, U, W> {
-        fn add_definitions_recursively(
-            definitions: &mut BTreeMap<borsh::schema::Declaration, borsh::schema::Definition>,
-        ) {
-            let len_width = if U <= usize::from(u8::MAX) {
-                1
-            } else if U <= usize::from(u16::MAX) {
-                2
-            } else {
-                4 // proven by design
-            };
+    #[cfg(feature = "borsh_schema")]
+    mod schema {
+        use super::*;
+        use alloc::collections::btree_map::{BTreeMap, Entry};
+        use borsh::BorshSchema;
 
-            let definition = borsh::schema::Definition::Sequence {
-                length_width: len_width,
-                #[expect(clippy::expect_used)]
-                length_range: core::ops::RangeInclusive::<u64>::new(
-                    u64::try_from(L).expect("proved by design"),
-                    u64::try_from(U).expect("proved by design"),
-                ),
-                elements: T::declaration(),
-            };
-            match definitions.entry(Self::declaration()) {
-                Entry::Occupied(occ) => {
-                    let existing_def = occ.get();
-                    assert_eq!(
-                        existing_def,
-                        &definition,
-                        "Redefining type schema for {}. Types with the same names are not supported.",
-                        occ.key()
-                    );
+        impl<T: BorshSchema, const L: usize, const U: usize, W> BorshSchema for BoundedVec<T, L, U, W> {
+            fn add_definitions_recursively(
+                definitions: &mut BTreeMap<borsh::schema::Declaration, borsh::schema::Definition>,
+            ) {
+                let len_width = if U <= usize::from(u8::MAX) {
+                    1
+                } else if U <= usize::from(u16::MAX) {
+                    2
+                } else {
+                    4 // proven by design
+                };
+
+                let definition = borsh::schema::Definition::Sequence {
+                    length_width: len_width,
+                    #[expect(clippy::expect_used)]
+                    length_range: core::ops::RangeInclusive::<u64>::new(
+                        u64::try_from(L).expect("proved by design"),
+                        u64::try_from(U).expect("proved by design"),
+                    ),
+                    elements: T::declaration(),
+                };
+                match definitions.entry(Self::declaration()) {
+                    Entry::Occupied(occ) => {
+                        let existing_def = occ.get();
+                        assert_eq!(
+                            existing_def,
+                            &definition,
+                            "Redefining type schema for {}. Types with the same names are not supported.",
+                            occ.key()
+                        );
+                    }
+                    Entry::Vacant(vac) => {
+                        vac.insert(definition);
+                    }
                 }
-                Entry::Vacant(vac) => {
-                    vac.insert(definition);
-                }
+                T::add_definitions_recursively(definitions);
             }
-            T::add_definitions_recursively(definitions);
-        }
 
-        fn declaration() -> borsh::schema::Declaration {
-            alloc::format!("BoundedVec<{}, {}, {}>", T::declaration(), L, U)
+            fn declaration() -> borsh::schema::Declaration {
+                alloc::format!("BoundedVec<{}, {}, {}>", T::declaration(), L, U)
+            }
         }
     }
 }

@@ -15,15 +15,16 @@ serde = { version = "1.0.123", default-features = false, features = [
 schemars = { version = "1.2.0", default-features = false, optional = true }
 thiserror = { version = "2", default-features = false }
 proptest = { version = "1.7", optional = true }
-borsh = { version = "1.5.7", default-features = false, features = ["unstable__schema"], optional = true}
+borsh = { version = "1.5.7", default-features = false, optional = true }
 kitness = { git = "https://github.com/dzmitry-lahoda/kitness", default-features = false }
 
 [features]
-all-stable = ["serde", "borsh", "arbitrary"]
+all-stable = ["serde", "schemars", "borsh", "borsh_schema", "arbitrary"]
 serde = ["dep:serde"]
 schemars = ["serde", "dep:schemars", "kitness/json"]
 arbitrary = ["proptest"]
 borsh = ["dep:borsh", "kitness/borsh"]
+borsh_schema = ["borsh", "borsh/unstable__schema"]
 nightly = []
 
 [dev-dependencies]

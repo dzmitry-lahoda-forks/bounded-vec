@@ -127,7 +127,6 @@ fn into_iter() {
 #[cfg(feature = "borsh")]
 mod borsh_tests {
     use super::*;
-    use borsh::schema::BorshSchemaContainer;
     use borsh::{BorshDeserialize, BorshSerialize};
 
     #[test]
@@ -146,12 +145,41 @@ mod borsh_tests {
         assert_eq!(data.get(1), compatible_decoded.get(1));
         assert!(BoundedVec::<u8, 1, 257>::deserialize(&mut buf.as_slice()).is_err());
 
+        let empty_data: EmptyBoundedVec<u8, 8> = Vec::new().try_into().expect("borsh works");
+        let buf = &mut Vec::new();
+        empty_data.serialize(buf).expect("borsh works");
+        let decoded_empty =
+            EmptyBoundedVec::<u8, 8>::deserialize(&mut buf.as_slice()).expect("borsh works");
+        assert_eq!(empty_data.as_slice(), decoded_empty.as_slice());
+    }
+}
+
+#[cfg(feature = "borsh_schema")]
+mod borsh_schema_tests {
+    use super::*;
+    use borsh::schema::BorshSchemaContainer;
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn borsh_schema() {
         let schema = BorshSchemaContainer::for_type::<BoundedVec<u8, 2, 8>>();
         let schema = schema
             .get_definition("BoundedVec<u8, 2, 8>")
             .expect("borsh works");
         assert!(matches!(
             schema,
+            borsh::schema::Definition::Sequence {
+                length_width: 1,
+                ..
+            }
+        ));
+
+        let schema_empty = BorshSchemaContainer::for_type::<EmptyBoundedVec<u8, 8>>();
+        let schema_empty = schema_empty
+            .get_definition("BoundedVec<u8, 0, 8>")
+            .expect("borsh works");
+        assert!(matches!(
+            schema_empty,
             borsh::schema::Definition::Sequence {
                 length_width: 1,
                 ..
@@ -199,6 +227,7 @@ mod schema_tests {
 }
 
 #[cfg(feature = "arbitrary")]
+#[allow(clippy::len_zero)]
 mod arb_tests {
     use super::*;
     use proptest::prelude::*;
