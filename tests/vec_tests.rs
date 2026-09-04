@@ -124,6 +124,92 @@ fn into_iter() {
     );
 }
 
+#[test]
+fn deref_and_slice_methods() {
+    let mut data: BoundedVec<i32, 2, 8> = vec![3, 1, 2].try_into().unwrap();
+    assert_eq!(data[0], 3);
+    assert_eq!(&data[1..], &[1, 2]);
+    data.sort_unstable();
+    assert_eq!(data.as_slice(), &[1, 2, 3]);
+    assert_eq!(data.binary_search(&2), Ok(1));
+    data[0] = 10;
+    assert_eq!(data[0], 10);
+}
+
+#[test]
+fn insert_and_try_insert() {
+    let mut data: BoundedVec<i32, 1, 3> = vec![1, 3].try_into().unwrap();
+    data.insert(1, 2);
+    assert_eq!(data.as_slice(), &[1, 2, 3]);
+    assert!(data.try_insert(0, 0).is_err());
+    assert_eq!(data.len(), 3);
+}
+
+#[test]
+fn capacity_and_reserve() {
+    let mut data: BoundedVec<i32, 1, 10> = vec![1].try_into().unwrap();
+    data.reserve(5);
+    assert!(data.capacity() >= 6);
+    data.shrink_to_fit();
+}
+
+#[test]
+fn empty_bounded_vec_operations() {
+    let mut v: EmptyBoundedVec<i32, 5> = EmptyBoundedVec::new();
+    assert!(v.is_empty());
+    assert_eq!(v.first_mut(), None);
+    assert_eq!(v.last_mut(), None);
+    v.push(1);
+    v.push(2);
+    v.push(2);
+    v.push(3);
+    assert_eq!(v.first_mut(), Some(&mut 1));
+    assert_eq!(v.last_mut(), Some(&mut 3));
+    v.dedup();
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+    assert_eq!(v.remove(1), 2);
+    assert_eq!(v.as_slice(), &[1, 3]);
+    assert_eq!(v.pop(), Some(3));
+    v.clear();
+    assert!(v.is_empty());
+}
+
+#[test]
+fn non_empty_vec_operations() {
+    let mut v: NonEmptyVec<i32> = NonEmptyVec::new(1);
+    assert_eq!(*v.first(), 1);
+    assert_eq!(*v.first_mut(), 1);
+    assert_eq!(*v.last(), 1);
+    v.push(2);
+    v.push(2);
+    v.push(3);
+    v.dedup();
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+    assert_eq!(v.split_first(), (&1, &[2, 3][..]));
+    assert_eq!(v.split_last(), (&3, &[1, 2][..]));
+    assert_eq!(v.try_pop(), Ok(3));
+    assert_eq!(v.try_pop(), Ok(2));
+    assert!(v.try_pop().is_err());
+    assert_eq!(v.len(), 1);
+    assert!(v.try_remove(0).is_err());
+}
+
+#[test]
+fn from_head_tail() {
+    let v: NonEmptyVec<i32> = NonEmptyVec::from_head_tail(1, vec![2, 3]).unwrap();
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+}
+
+#[test]
+fn extend_impl() {
+    let mut v: BoundedVec<i32, 1, 8> = vec![1].try_into().unwrap();
+    v.extend(vec![2, 3]);
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+    let more = [4, 5];
+    v.extend(&more);
+    assert_eq!(v.as_slice(), &[1, 2, 3, 4, 5]);
+}
+
 #[cfg(feature = "borsh")]
 mod borsh_tests {
     use super::*;
