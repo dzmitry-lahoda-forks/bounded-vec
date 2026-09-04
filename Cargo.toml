@@ -1,32 +1,32 @@
 [package]
 name = "const-bounded-collections"
-version = "0.9.0"
+version = "0.10.0"
 license = "CC0-1.0"
-authors = ["Denys Zadorozhnyi <denys@zadorozhnyi.com>"]
 edition = "2024"
 description = "Rust Vec wrapper with type guarantees on lower and upper bounds for items quantity."
 repository = "https://github.com/n1xyz/const-bounded-collections"
 
 [dependencies]
-serde = { version = "1.0.123", default-features = false, features = [
+serde = { version = "1.0", default-features = false, features = [
     "alloc",
     "derive",
 ], optional = true }
 schemars = { version = "1.2.0", default-features = false, optional = true }
 thiserror = { version = "2", default-features = false }
 proptest = { version = "1.7", optional = true }
-borsh = { version = "1.5.7", default-features = false, optional = true }
-kitness = { git = "https://github.com/dzmitry-lahoda/kitness", default-features = false }
+borsh = { version = "1.6", default-features = false, optional = true }
+kitness = { git = "https://github.com/dzmitry-lahoda/kitness", rev = "9ea9982abc404e17d1e88654cc67a3f50c5d84cc", default-features = false }
 
 [features]
-all-stable = ["serde", "schemars", "borsh", "borsh_schema", "arbitrary"]
 serde = ["dep:serde"]
 schemars = ["serde", "dep:schemars", "kitness/json"]
 arbitrary = ["proptest"]
 borsh = ["dep:borsh", "kitness/borsh"]
 borsh_schema = ["borsh", "borsh/unstable__schema"]
+panic = []
 nightly = []
 
 [dev-dependencies]
 proptest = { version = "1.7" }
 serde_json = { version = "1.0", default-features = false, features = ["std"]}
+no-panic = { version = "0.1.37" }

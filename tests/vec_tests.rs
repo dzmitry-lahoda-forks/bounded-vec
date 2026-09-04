@@ -137,12 +137,28 @@ fn deref_and_slice_methods() {
 }
 
 #[test]
-fn insert_and_try_insert() {
+fn try_insert() {
     let mut data: BoundedVec<i32, 1, 3> = vec![1, 3].try_into().unwrap();
-    data.insert(1, 2);
+    data.try_insert(1, 2).unwrap();
     assert_eq!(data.as_slice(), &[1, 2, 3]);
     assert!(data.try_insert(0, 0).is_err());
     assert_eq!(data.len(), 3);
+}
+
+#[test]
+#[cfg(feature = "panic")]
+fn insert() {
+    let mut data: BoundedVec<i32, 1, 3> = vec![1, 3].try_into().unwrap();
+    data.insert(1, 2);
+    assert_eq!(data.as_slice(), &[1, 2, 3]);
+}
+
+#[test]
+#[cfg(feature = "panic")]
+#[should_panic(expected = "already at upper bound")]
+fn insert_panics_at_upper_bound() {
+    let mut data: BoundedVec<i32, 1, 1> = vec![1].try_into().unwrap();
+    data.insert(0, 2);
 }
 
 #[test]
@@ -159,10 +175,10 @@ fn empty_bounded_vec_operations() {
     assert!(v.is_empty());
     assert_eq!(v.first_mut(), None);
     assert_eq!(v.last_mut(), None);
-    v.push(1);
-    v.push(2);
-    v.push(2);
-    v.push(3);
+    v.try_push(1).unwrap();
+    v.try_push(2).unwrap();
+    v.try_push(2).unwrap();
+    v.try_push(3).unwrap();
     assert_eq!(v.first_mut(), Some(&mut 1));
     assert_eq!(v.last_mut(), Some(&mut 3));
     v.dedup();
@@ -180,9 +196,9 @@ fn non_empty_vec_operations() {
     assert_eq!(*v.first(), 1);
     assert_eq!(*v.first_mut(), 1);
     assert_eq!(*v.last(), 1);
-    v.push(2);
-    v.push(2);
-    v.push(3);
+    v.try_push(2).unwrap();
+    v.try_push(2).unwrap();
+    v.try_push(3).unwrap();
     v.dedup();
     assert_eq!(v.as_slice(), &[1, 2, 3]);
     assert_eq!(v.split_first(), (&1, &[2, 3][..]));
@@ -201,6 +217,7 @@ fn from_head_tail() {
 }
 
 #[test]
+#[cfg(feature = "panic")]
 fn extend_impl() {
     let mut v: BoundedVec<i32, 1, 8> = vec![1].try_into().unwrap();
     v.extend(vec![2, 3]);
@@ -208,6 +225,138 @@ fn extend_impl() {
     let more = [4, 5];
     v.extend(&more);
     assert_eq!(v.as_slice(), &[1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn try_extend_is_transactional() {
+    let mut v: BoundedVec<i32, 1, 3> = vec![1].try_into().unwrap();
+    v.try_extend([2, 3]).unwrap();
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+
+    let error = v.try_extend([4, 5]).unwrap_err();
+    assert_eq!(
+        error,
+        BoundedVecOutOfBounds::UpperBoundError {
+            upper_bound: 3,
+            got_larger_by: 2,
+        }
+    );
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+}
+
+#[test]
+fn try_extend_stops_at_first_excess_item() {
+    for initial in [vec![], vec![1], vec![1, 2, 3]] {
+        let mut v: EmptyBoundedVec<i32, 3> = initial.clone().try_into().unwrap();
+        let max_consumed = 3 - initial.len() + 1;
+        let mut consumed = 0;
+        let infinite = std::iter::from_fn(|| {
+            consumed += 1;
+            assert!(consumed <= max_consumed, "iterator consumed past the bound");
+            Some(4)
+        });
+        assert_eq!(
+            v.try_extend(infinite),
+            Err(BoundedVecOutOfBounds::UpperBoundError {
+                upper_bound: 3,
+                got_larger_by: 1,
+            })
+        );
+        assert_eq!(consumed, max_consumed);
+        assert_eq!(v.as_slice(), initial.as_slice());
+    }
+}
+
+#[test]
+fn try_extend_rejects_large_exact_size_input_without_consuming_it() {
+    let mut v: EmptyBoundedVec<usize, 3> = vec![1].try_into().unwrap();
+    let oversized = (0..usize::MAX).inspect(|_| panic!("must not consume oversized input"));
+    assert_eq!(
+        v.try_extend(oversized),
+        Err(BoundedVecOutOfBounds::UpperBoundError {
+            upper_bound: 3,
+            got_larger_by: usize::MAX - 2,
+        })
+    );
+    assert_eq!(v.as_slice(), &[1]);
+}
+
+#[test]
+fn try_extend_accepts_unknown_size_input_at_the_bound() {
+    let mut v: EmptyBoundedVec<i32, 3> = vec![1].try_into().unwrap();
+    v.try_extend([2, 3].into_iter().filter(|_| true)).unwrap();
+    v.try_extend(std::iter::empty()).unwrap();
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+}
+
+#[test]
+#[cfg(not(any(feature = "schemars", feature = "borsh", feature = "borsh_schema")))]
+fn checked_length_math_handles_maximum_zst_vec() {
+    let mut v: EmptyBoundedVec<(), { usize::MAX }> = vec![(); usize::MAX].try_into().unwrap();
+    let (_, error) = v.try_push(()).unwrap_err();
+    assert_eq!(
+        error,
+        BoundedVecOutOfBounds::UpperBoundError {
+            upper_bound: usize::MAX,
+            got_larger_by: 1,
+        }
+    );
+
+    let error = NonEmptyVec::from_head_tail((), vec![(); usize::MAX]).unwrap_err();
+    assert_eq!(
+        error,
+        BoundedVecOutOfBounds::UpperBoundError {
+            upper_bound: usize::MAX,
+            got_larger_by: 1,
+        }
+    );
+}
+
+#[test]
+fn non_empty_drain_stops_at_lower_bound() {
+    let mut v: BoundedVec<i32, 2, 8> = vec![1, 2, 3, 4, 5].try_into().unwrap();
+    assert_eq!(v.drain(..).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(v.as_slice(), &[4, 5]);
+
+    let drained = v.drain(..);
+    core::mem::forget(drained);
+    assert_eq!(v.as_slice(), &[4, 5]);
+}
+
+#[test]
+fn common_mapping_methods_support_empty_witness() {
+    let v: EmptyBoundedVec<i32, 4> = vec![1, 2].try_into().unwrap();
+    let mapped: EmptyBoundedVec<i32, 4> = v.mapped(|item| item * 2);
+    assert_eq!(mapped.as_slice(), &[2, 4]);
+
+    let empty: EmptyBoundedVec<i32, 4> = EmptyBoundedVec::new();
+    let enumerated: EmptyBoundedVec<(usize, i32), 4> = empty.enumerated();
+    assert!(enumerated.is_empty());
+}
+
+#[test]
+#[cfg(feature = "panic")]
+fn panic_feature_exposes_mutable_vec_access() {
+    let mut v: EmptyBoundedVec<i32, 1> = EmptyBoundedVec::new();
+    AsMut::<Vec<_>>::as_mut(&mut v).extend([1, 2]);
+    assert_eq!(v.len(), 2);
+    assert_eq!(
+        v.try_push(3).unwrap_err().1,
+        BoundedVecOutOfBounds::UpperBoundError {
+            upper_bound: 1,
+            got_larger_by: 2,
+        }
+    );
+
+    let mut non_empty = NonEmptyVec::new(1);
+    AsMut::<Vec<_>>::as_mut(&mut non_empty).clear();
+    assert_eq!(
+        non_empty.try_pop(),
+        Err(BoundedVecOutOfBounds::LowerBoundError {
+            lower_bound: 1,
+            got_smaller_by: 1,
+        })
+    );
 }
 
 #[cfg(feature = "borsh")]
@@ -309,6 +458,62 @@ mod schema_tests {
         let max_items = schema_value["maxItems"].as_u64().unwrap() as u32;
         assert_eq!(min_items, 2);
         assert_eq!(max_items, 8);
+    }
+}
+
+mod invariant_prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn non_empty_drain_matches_clamped_vec_drain(
+            values in proptest::collection::vec(any::<u8>(), 2..=8),
+            start_seed in any::<usize>(),
+            end_seed in any::<usize>(),
+        ) {
+            let mut bounded: BoundedVec<u8, 2, 8> = values.clone().try_into().unwrap();
+            let start = start_seed % (values.len() + 1);
+            let requested_len = end_seed % (values.len() - start + 1);
+            let end = start + requested_len;
+            let drained_len = requested_len.min(values.len() - 2);
+
+            let mut expected_remaining = values;
+            let expected_drained = expected_remaining
+                .drain(start..start + drained_len)
+                .collect::<Vec<_>>();
+            let actual_drained = bounded.drain(start..end).collect::<Vec<_>>();
+
+            prop_assert_eq!(actual_drained, expected_drained);
+            prop_assert_eq!(bounded.as_slice(), expected_remaining.as_slice());
+            prop_assert!(bounded.len() >= 2);
+        }
+
+        #[test]
+        fn try_extend_is_bounded_and_transactional(
+            initial in proptest::collection::vec(any::<u8>(), 0..=8),
+            additional in proptest::collection::vec(any::<u8>(), 0..=12),
+        ) {
+            let mut bounded: EmptyBoundedVec<u8, 8> = initial.clone().try_into().unwrap();
+            let result = bounded.try_extend(additional.clone());
+            let attempted_len = initial.len() + additional.len();
+
+            if attempted_len <= 8 {
+                let mut expected = initial;
+                expected.extend(additional);
+                prop_assert!(result.is_ok());
+                prop_assert_eq!(bounded.as_slice(), expected.as_slice());
+            } else {
+                prop_assert_eq!(
+                    result,
+                    Err(BoundedVecOutOfBounds::UpperBoundError {
+                        upper_bound: 8,
+                        got_larger_by: attempted_len - 8,
+                    })
+                );
+                prop_assert_eq!(bounded.as_slice(), initial.as_slice());
+            }
+        }
     }
 }
 

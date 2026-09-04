@@ -1,7 +1,7 @@
 use crate::witnesses;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::convert::{TryFrom, TryInto};
+use core::convert::TryFrom;
 use core::slice::{Iter, IterMut};
 use thiserror::Error;
 
@@ -29,21 +29,67 @@ pub struct BoundedVec<
 #[derive(Error, PartialEq, Eq, Debug, Clone)]
 pub enum BoundedVecOutOfBounds {
     /// Items quantity is less than L (lower bound)
-    #[error("Lower bound violation: got {got} (expected >= {lower_bound})")]
+    #[error("Lower bound violation: smaller by {got_smaller_by} than {lower_bound}")]
     LowerBoundError {
         /// L (lower bound)
         lower_bound: usize,
-        /// provided value
-        got: usize,
+        /// Number of items below the lower bound
+        got_smaller_by: usize,
     },
     /// Items quantity is more than U (upper bound)
-    #[error("Upper bound violation: got {got} (expected <= {upper_bound})")]
+    #[error("Upper bound violation: larger by {got_larger_by} than {upper_bound}")]
     UpperBoundError {
         /// U (upper bound)
         upper_bound: usize,
-        /// provided value
-        got: usize,
+        /// Number of items above the upper bound
+        got_larger_by: usize,
     },
+}
+
+fn normalized_range<R: core::ops::RangeBounds<usize>>(
+    range: &R,
+    len: usize,
+) -> core::ops::Range<usize> {
+    let start = match range.start_bound() {
+        core::ops::Bound::Included(start) => *start,
+        core::ops::Bound::Excluded(start) => match start.checked_add(1) {
+            Some(start) => start,
+            None => panic!("range start index overflow"),
+        },
+        core::ops::Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        core::ops::Bound::Included(end) => match end.checked_add(1) {
+            Some(end) => end,
+            None => panic!("range end index overflow"),
+        },
+        core::ops::Bound::Excluded(end) => *end,
+        core::ops::Bound::Unbounded => len,
+    };
+    assert!(
+        start <= end,
+        "slice index starts at {start} but ends at {end}"
+    );
+    assert!(
+        end <= len,
+        "range end index {end} out of range for slice of length {len}"
+    );
+    start..end
+}
+
+fn larger_by_after_adding(len: usize, additional: usize, upper_bound: usize) -> usize {
+    match len.checked_add(additional) {
+        Some(new_len) => new_len.saturating_sub(upper_bound),
+        None if len <= upper_bound => additional.saturating_sub(upper_bound - len),
+        None => usize::MAX,
+    }
+}
+
+fn smaller_by_after_removing(len: usize, removed: usize, lower_bound: usize) -> usize {
+    match len.checked_sub(removed) {
+        Some(new_len) => lower_bound.saturating_sub(new_len),
+        None => lower_bound,
+    }
 }
 
 impl<T, const U: usize> Default for BoundedVec<T, 0, U, witnesses::Empty<U>> {
@@ -79,7 +125,7 @@ impl<T, const U: usize> BoundedVec<T, 0, U, witnesses::Empty<U>> {
         if len > U {
             Err(BoundedVecOutOfBounds::UpperBoundError {
                 upper_bound: U,
-                got: len,
+                got_larger_by: len - U,
             })
         } else {
             Ok(BoundedVec {
@@ -102,21 +148,6 @@ impl<T, const U: usize> BoundedVec<T, 0, U, witnesses::Empty<U>> {
     /// ```
     pub fn first(&self) -> Option<&T> {
         self.inner.first()
-    }
-
-    /// Returns `true` if the vector contains no elements
-    ///
-    /// # Example
-    /// ```
-    /// use const_bounded_collections::BoundedVec;
-    /// use const_bounded_collections::witnesses;
-    /// use std::convert::TryInto;
-    ///
-    /// let data: BoundedVec<u8, 0, 8, witnesses::Empty<8>> = vec![1u8, 2].try_into().unwrap();
-    /// assert_eq!(data.is_empty(), false);
-    /// ```
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 
     /// Constructs a new, empty `BoundedVec`.
@@ -191,6 +222,44 @@ impl<T, const U: usize> BoundedVec<T, 0, U, witnesses::Empty<U>> {
         self.inner.remove(index)
     }
 
+    /// Removes the subslice indicated by the given range and returns a
+    /// double-ended iterator over the removed elements.
+    ///
+    /// If the iterator is dropped before being fully consumed, it drops the
+    /// remaining removed elements. The returned iterator keeps a mutable borrow
+    /// on the vector to optimize its implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point or if the
+    /// end point is greater than the vector length.
+    ///
+    /// # Leaking
+    ///
+    /// If the iterator is not dropped (for example, through [`core::mem::forget`]),
+    /// the vector may have lost and leaked elements arbitrarily, including
+    /// elements outside the range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use const_bounded_collections::EmptyBoundedVec;
+    /// let mut v: EmptyBoundedVec<i32, 4> = vec![1, 2, 3].try_into().unwrap();
+    /// let u: Vec<_> = v.drain(1..).collect();
+    /// assert_eq!(v.as_slice(), &[1]);
+    /// assert_eq!(u, &[2, 3]);
+    ///
+    /// // A full range clears the vector, like `clear()` does.
+    /// v.drain(..);
+    /// assert!(v.is_empty());
+    /// ```
+    pub fn drain<R>(&mut self, range: R) -> alloc::vec::Drain<'_, T>
+    where
+        R: core::ops::RangeBounds<usize>,
+    {
+        self.inner.drain(range)
+    }
+
     /// Clears the vector, removing all values.
     ///
     /// # Example
@@ -245,14 +314,43 @@ impl<T, const U: usize> BoundedVec<T, 0, U, witnesses::Empty<U>> {
 
 /// Methods which works for all witnesses
 impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
-    /// # Safety
-    /// ## Panics
+    /// Returns the number of elements in the vector.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use const_bounded_collections::BoundedVec;
+    /// let data: BoundedVec<u8, 2, 4> = vec![1u8, 2].try_into().unwrap();
+    /// assert_eq!(data.len(), 2);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns `true` if the vector contains no elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use const_bounded_collections::EmptyBoundedVec;
+    /// let data: EmptyBoundedVec<u8, 8> = vec![1u8, 2].try_into().unwrap();
+    /// assert!(!data.is_empty());
+    /// assert!(EmptyBoundedVec::<u8, 8>::new().is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Appends an item to the vector.
+    ///
+    /// # Panics
     ///
     /// Panics if will be greater than `U`.
+    #[cfg(feature = "panic")]
     pub fn push(&mut self, item: T) {
         let len = self.inner.len();
         // NOTE: need to thing if split unbounded `usize::MAX`(panic) and bounded(return error)
-        if len == U {
+        if len >= U {
             panic!(
                 "Cannot push item to BoundedVec: length {} is already at upper bound {}",
                 len, U
@@ -273,45 +371,6 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
     /// ```
     pub fn as_vec(&self) -> &Vec<T> {
         &self.inner
-    }
-
-    /// Removes the subslice indicated by the given range from the vector,
-    /// returning a double-ended iterator over the removed subslice.
-    ///
-    /// If the iterator is dropped before being fully consumed,
-    /// it drops the remaining removed elements.
-    ///
-    /// The returned iterator keeps a mutable borrow on the vector to optimize
-    /// its implementation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the starting point is greater than the end point or if
-    /// the end point is greater than the length of the vector.
-    ///
-    /// # Leaking
-    ///
-    /// If the returned iterator goes out of scope without being dropped (due to
-    /// [`core::mem::forget`], for example), the vector may have lost and leaked
-    /// elements arbitrarily, including elements outside the range.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let mut v = vec![1, 2, 3];
-    /// let u: Vec<_> = v.drain(1..).collect();
-    /// assert_eq!(v, &[1]);
-    /// assert_eq!(u, &[2, 3]);
-    ///
-    /// // A full range clears the vector, like `clear()` does
-    /// v.drain(..);
-    /// assert_eq!(v, &[]);
-    /// ```
-    pub fn drain<R>(&mut self, range: R) -> alloc::vec::Drain<'_, T>
-    where
-        R: core::ops::RangeBounds<usize>,
-    {
-        self.inner.drain(range)
     }
 
     /// Returns an underlying `Vec``
@@ -382,6 +441,7 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
 
     /// Appends an element to the back of the vector, returning an error if
     /// the vector length is already at upper bound `U`.
+    #[cfg_attr(all(test, not(debug_assertions)), no_panic::no_panic)]
     pub fn try_push(&mut self, item: T) -> Result<(), (T, BoundedVecOutOfBounds)> {
         let len = self.inner.len();
         if len >= U {
@@ -389,11 +449,44 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
                 item,
                 BoundedVecOutOfBounds::UpperBoundError {
                     upper_bound: U,
-                    got: len + 1,
+                    got_larger_by: larger_by_after_adding(len, 1, U),
                 },
             ));
         }
         self.inner.push(item);
+        Ok(())
+    }
+
+    /// Extends the vector, returning an error without changing it if the final
+    /// length would exceed upper bound `U`.
+    ///
+    /// Buffers at most the remaining capacity and stops at the first excess item.
+    /// `got_larger_by` is a lower bound on the excess, using the iterator's size
+    /// hint when available; it is exact for exact-size iterators.
+    #[cfg_attr(all(test, not(debug_assertions)), no_panic::no_panic)]
+    pub fn try_extend<I>(&mut self, iter: I) -> Result<(), BoundedVecOutOfBounds>
+    where
+        I: IntoIterator<Item = T>,
+    {
+        let mut iter = iter.into_iter();
+        let len = self.inner.len();
+        let additional = iter.size_hint().0;
+        let got_larger_by = larger_by_after_adding(len, additional, U);
+        if got_larger_by != 0 {
+            return Err(BoundedVecOutOfBounds::UpperBoundError {
+                upper_bound: U,
+                got_larger_by,
+            });
+        }
+        let remaining = U.saturating_sub(len);
+        let mut items: Vec<T> = iter.by_ref().take(remaining).collect();
+        if items.len() == remaining && iter.next().is_some() {
+            return Err(BoundedVecOutOfBounds::UpperBoundError {
+                upper_bound: U,
+                got_larger_by: 1,
+            });
+        }
+        self.inner.append(&mut items);
         Ok(())
     }
 
@@ -404,6 +497,7 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
     ///
     /// Panics if `index > len`.
     /// Panics if the vector length is already at upper bound `U`.
+    #[cfg(feature = "panic")]
     pub fn insert(&mut self, index: usize, element: T) {
         let len = self.inner.len();
         if len >= U {
@@ -421,6 +515,7 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
     /// # Panics
     ///
     /// Panics if `index > len`.
+    #[cfg_attr(all(test, not(debug_assertions)), no_panic::no_panic)]
     pub fn try_insert(
         &mut self,
         index: usize,
@@ -432,7 +527,7 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
                 element,
                 BoundedVecOutOfBounds::UpperBoundError {
                     upper_bound: U,
-                    got: len + 1,
+                    got_larger_by: larger_by_after_adding(len, 1, U),
                 },
             ));
         }
@@ -464,6 +559,129 @@ impl<T, const L: usize, const U: usize, W> BoundedVec<T, L, U, W> {
     pub fn shrink_to_fit(&mut self) {
         self.inner.shrink_to_fit();
     }
+
+    /// Creates a new `BoundedVec` by consuming `self` and mapping each element.
+    ///
+    /// The result preserves the length, bounds `L` and `U`, and witness `W`,
+    /// even though the original vector is consumed and turned into an iterator.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use const_bounded_collections::BoundedVec;
+    /// let data: BoundedVec<u8, 2, 8> = [1u8, 2].into();
+    /// let data = data.mapped(|x| x * 2);
+    /// assert_eq!(data, [2u8, 4].into());
+    /// ```
+    pub fn mapped<F, N>(self, map_fn: F) -> BoundedVec<N, L, U, W>
+    where
+        F: FnMut(T) -> N,
+    {
+        BoundedVec {
+            inner: self.inner.into_iter().map(map_fn).collect(),
+            witness: self.witness,
+        }
+    }
+
+    /// Creates a new `BoundedVec` by mapping references to every element.
+    ///
+    /// The result preserves the length and bounds `L` and `U`, and clones the
+    /// witness `W`. The original vector remains available.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use const_bounded_collections::BoundedVec;
+    /// let data: BoundedVec<u8, 2, 8> = [1u8, 2].into();
+    /// let mapped = data.mapped_ref(|x| x * 2);
+    /// assert_eq!(mapped, [2u8, 4].into());
+    /// assert_eq!(data.as_slice(), &[1, 2]);
+    /// ```
+    pub fn mapped_ref<F, N>(&self, map_fn: F) -> BoundedVec<N, L, U, W>
+    where
+        F: FnMut(&T) -> N,
+        W: Clone,
+    {
+        BoundedVec {
+            inner: self.inner.iter().map(map_fn).collect(),
+            witness: self.witness.clone(),
+        }
+    }
+
+    /// Creates a new `BoundedVec` by consuming `self` and fallibly mapping each element.
+    ///
+    /// On success, the result preserves the length, bounds `L` and `U`, and
+    /// witness `W`. This behaves like chaining `into_iter()`, `map`, and
+    /// `collect::<Result<Vec<N>, E>>()`, then wrapping the result in a `BoundedVec`.
+    ///
+    /// Since this method consumes `self`, an error drops the remaining input
+    /// elements and any output elements already produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from `map_fn` immediately, without mapping any
+    /// remaining elements.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use const_bounded_collections::BoundedVec;
+    /// let data: BoundedVec<u8, 2, 8> = [1u8, 2].into();
+    /// let data: Result<BoundedVec<u8, 2, 8>, _> = data.try_mapped(|_| Err("failed"));
+    /// assert_eq!(data, Err("failed"));
+    /// ```
+    pub fn try_mapped<F, N, E>(self, map_fn: F) -> Result<BoundedVec<N, L, U, W>, E>
+    where
+        F: FnMut(T) -> Result<N, E>,
+    {
+        let witness = self.witness;
+        let inner = self
+            .inner
+            .into_iter()
+            .map(map_fn)
+            .collect::<Result<_, _>>()?;
+        Ok(BoundedVec { inner, witness })
+    }
+
+    /// Creates a new `BoundedVec` by fallibly mapping references to every element.
+    ///
+    /// On success, the result preserves the length and bounds `L` and `U`, and
+    /// clones the witness `W`. The original vector is borrowed and remains
+    /// available even if mapping fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error from `map_fn` immediately, without mapping any
+    /// remaining elements. Any output elements already produced are dropped.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use const_bounded_collections::BoundedVec;
+    /// let data: BoundedVec<u8, 2, 8> = [1u8, 2].into();
+    /// let mapped: Result<BoundedVec<u8, 2, 8>, _> = data.try_mapped_ref(|_| Err("failed"));
+    /// assert_eq!(mapped, Err("failed"));
+    /// assert_eq!(data.as_slice(), &[1, 2]);
+    /// ```
+    pub fn try_mapped_ref<F, N, E>(&self, map_fn: F) -> Result<BoundedVec<N, L, U, W>, E>
+    where
+        F: FnMut(&T) -> Result<N, E>,
+        W: Clone,
+    {
+        let inner = self.inner.iter().map(map_fn).collect::<Result<_, _>>()?;
+        Ok(BoundedVec {
+            inner,
+            witness: self.witness.clone(),
+        })
+    }
+
+    /// Returns a new `BoundedVec` with indices included.
+    pub fn enumerated(self) -> BoundedVec<(usize, T), L, U, W> {
+        BoundedVec {
+            inner: self.inner.into_iter().enumerate().collect(),
+            witness: self.witness,
+        }
+    }
 }
 
 impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<L, U>> {
@@ -491,12 +709,12 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         if len < L {
             Err(BoundedVecOutOfBounds::LowerBoundError {
                 lower_bound: L,
-                got: len,
+                got_smaller_by: L - len,
             })
         } else if len > U {
             Err(BoundedVecOutOfBounds::UpperBoundError {
                 upper_bound: U,
-                got: len,
+                got_larger_by: len - U,
             })
         } else {
             Ok(BoundedVec {
@@ -504,20 +722,6 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
                 witness,
             })
         }
-    }
-
-    /// Returns the number of elements in the vector
-    ///
-    /// # Example
-    /// ```
-    /// use const_bounded_collections::BoundedVec;
-    /// use std::convert::TryInto;
-    ///
-    /// let data: BoundedVec<u8, 2, 4> = vec![1u8,2].try_into().unwrap();
-    /// assert_eq!(data.len(), 2);
-    /// ```
-    pub fn len(&self) -> usize {
-        self.inner.len()
     }
 
     /// Returns the first element of non-empty Vec
@@ -550,143 +754,10 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         self.inner.last().unwrap()
     }
 
-    /// Create a new `BoundedVec` by consuming `self` and mapping each element.
-    ///
-    /// This is useful as it keeps the knowledge that the length is >= U, <= L,
-    /// even through the old `BoundedVec` is consumed and turned into an iterator.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use const_bounded_collections::BoundedVec;
-    /// let data: BoundedVec<u8, 2, 8> = [1u8,2].into();
-    /// let data = data.mapped(|x|x*2);
-    /// assert_eq!(data, [2u8,4].into());
-    /// ```
-    pub fn mapped<F, N>(self, map_fn: F) -> BoundedVec<N, L, U, witnesses::NonEmpty<L, U>>
-    where
-        F: FnMut(T) -> N,
-    {
-        BoundedVec {
-            inner: self.inner.into_iter().map(map_fn).collect::<Vec<_>>(),
-            witness: witnesses::non_empty(),
-        }
-    }
-
-    /// Create a new `BoundedVec` by mapping references to the elements of self
-    ///
-    /// This is useful as it keeps the knowledge that the length is >= U, <= L,
-    /// will still hold for new `BoundedVec`
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use const_bounded_collections::BoundedVec;
-    /// let data: BoundedVec<u8, 2, 8> = [1u8,2].into();
-    /// let data = data.mapped_ref(|x|x*2);
-    /// assert_eq!(data, [2u8,4].into());
-    /// ```
-    pub fn mapped_ref<F, N>(&self, map_fn: F) -> BoundedVec<N, L, U, witnesses::NonEmpty<L, U>>
-    where
-        F: FnMut(&T) -> N,
-    {
-        BoundedVec {
-            inner: self.inner.iter().map(map_fn).collect::<Vec<_>>(),
-            witness: witnesses::non_empty(),
-        }
-    }
-
-    /// Create a new `BoundedVec` by consuming `self` and mapping each element
-    /// to a `Result`.
-    ///
-    /// This is useful as it keeps the knowledge that the length is preserved
-    /// even through the old `BoundedVec` is consumed and turned into an iterator.
-    ///
-    /// As this method consumes self, returning an error means that this
-    /// vec is dropped. I.e. this method behaves roughly like using a
-    /// chain of `into_iter()`, `map`, `collect::<Result<Vec<N>,E>>` and
-    /// then converting the `Vec` back to a `Vec1`.
-    ///
-    ///
-    /// # Errors
-    ///
-    /// Once any call to `map_fn` returns a error that error is directly
-    /// returned by this method.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use const_bounded_collections::BoundedVec;
-    /// let data: BoundedVec<u8, 2, 8> = [1u8,2].into();
-    /// let data: Result<BoundedVec<u8, 2, 8>, _> = data.try_mapped(|x| Err("failed"));
-    /// assert_eq!(data, Err("failed"));
-    /// ```
-    pub fn try_mapped<F, N, E>(
-        self,
-        map_fn: F,
-    ) -> Result<BoundedVec<N, L, U, witnesses::NonEmpty<L, U>>, E>
-    where
-        F: FnMut(T) -> Result<N, E>,
-    {
-        let mut map_fn = map_fn;
-        let mut out = Vec::with_capacity(self.len());
-        for element in self.inner.into_iter() {
-            out.push(map_fn(element)?);
-        }
-        #[allow(clippy::unwrap_used)]
-        Ok(BoundedVec::<N, L, U, witnesses::NonEmpty<L, U>>::from_vec(out).unwrap())
-    }
-
-    /// Create a new `BoundedVec` by mapping references of `self` elements
-    /// to a `Result`.
-    ///
-    /// This is useful as it keeps the knowledge that the length is preserved
-    /// even through the old `BoundedVec` is consumed and turned into an iterator.
-    ///
-    /// # Errors
-    ///
-    /// Once any call to `map_fn` returns a error that error is directly
-    /// returned by this method.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use const_bounded_collections::BoundedVec;
-    /// let data: BoundedVec<u8, 2, 8> = [1u8,2].into();
-    /// let data: Result<BoundedVec<u8, 2, 8>, _> = data.try_mapped_ref(|x| Err("failed"));
-    /// assert_eq!(data, Err("failed"));
-    /// ```
-    pub fn try_mapped_ref<F, N, E>(
-        &self,
-        map_fn: F,
-    ) -> Result<BoundedVec<N, L, U, witnesses::NonEmpty<L, U>>, E>
-    where
-        F: FnMut(&T) -> Result<N, E>,
-    {
-        let mut map_fn = map_fn;
-        let mut out = Vec::with_capacity(self.len());
-        for element in self.inner.iter() {
-            out.push(map_fn(element)?);
-        }
-        #[allow(clippy::unwrap_used)]
-        Ok(BoundedVec::<N, L, U, witnesses::NonEmpty<L, U>>::from_vec(out).unwrap())
-    }
-
     /// Returns the last and all the rest of the elements
     pub fn split_last(&self) -> (&T, &[T]) {
         #[allow(clippy::unwrap_used)]
         self.inner.split_last().unwrap()
-    }
-
-    /// Return a new BoundedVec with indices included
-    pub fn enumerated(self) -> BoundedVec<(usize, T), L, U, witnesses::NonEmpty<L, U>> {
-        #[allow(clippy::unwrap_used)]
-        self.inner
-            .into_iter()
-            .enumerate()
-            .collect::<Vec<(usize, T)>>()
-            .try_into()
-            .unwrap()
     }
 
     /// Return a Some(BoundedVec) or None if `v` is empty
@@ -742,6 +813,54 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         self.inner.split_last_mut().unwrap()
     }
 
+    /// Removes elements in `range`, but never more than `len - L`, and returns
+    /// an owning, double-ended iterator over the removed elements.
+    ///
+    /// If the requested range is larger than the removable amount, its end is
+    /// shortened so that exactly `L` elements remain. Removal is completed
+    /// before this method returns, so forgetting the iterator cannot violate
+    /// the lower bound.
+    ///
+    /// The returned iterator does not borrow the vector. Dropping it before it
+    /// is fully consumed drops the remaining removed elements.
+    ///
+    /// # Leaking
+    ///
+    /// Forgetting the iterator with [`core::mem::forget`] leaks its remaining
+    /// removed elements, but does not remove or leak any further vector elements.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point or if the
+    /// end point is greater than the vector length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use const_bounded_collections::BoundedVec;
+    /// let mut v: BoundedVec<i32, 2, 5> = vec![1, 2, 3, 4, 5].try_into().unwrap();
+    /// let removed: Vec<_> = v.drain(1..).collect();
+    /// assert_eq!(removed, &[2, 3, 4]);
+    /// assert_eq!(v.as_slice(), &[1, 5]);
+    ///
+    /// // A full range preserves at least the lower bound of two elements.
+    /// v.drain(..);
+    /// assert_eq!(v.as_slice(), &[1, 5]);
+    /// ```
+    pub fn drain<R>(&mut self, range: R) -> vec::IntoIter<T>
+    where
+        R: core::ops::RangeBounds<usize>,
+    {
+        let range = normalized_range(&range, self.inner.len());
+        let removable = self.inner.len().saturating_sub(L);
+        let drain_len = (range.end - range.start).min(removable);
+        let end = range.start + drain_len;
+        self.inner
+            .drain(range.start..end)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
     /// Removes the last element from the vector and returns it, or returns
     /// `LowerBoundError` if the vector length is already at lower bound `L`.
     pub fn try_pop(&mut self) -> Result<T, BoundedVecOutOfBounds> {
@@ -749,7 +868,7 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         if len <= L {
             return Err(BoundedVecOutOfBounds::LowerBoundError {
                 lower_bound: L,
-                got: len - 1,
+                got_smaller_by: smaller_by_after_removing(len, 1, L),
             });
         }
         #[allow(clippy::unwrap_used)]
@@ -767,7 +886,7 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         if len <= L {
             return Err(BoundedVecOutOfBounds::LowerBoundError {
                 lower_bound: L,
-                got: len - 1,
+                got_smaller_by: smaller_by_after_removing(len, 1, L),
             });
         }
         if index >= len {
@@ -781,7 +900,7 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         if len < L {
             return Err(BoundedVecOutOfBounds::LowerBoundError {
                 lower_bound: L,
-                got: len,
+                got_smaller_by: L - len,
             });
         }
         self.inner.truncate(len);
@@ -799,7 +918,7 @@ impl<T, const L: usize, const U: usize> BoundedVec<T, L, U, witnesses::NonEmpty<
         if v.len() < L {
             return Err(BoundedVecOutOfBounds::LowerBoundError {
                 lower_bound: L,
-                got: v.len(),
+                got_smaller_by: L - v.len(),
             });
         }
         self.inner = v;
@@ -834,14 +953,24 @@ impl<T, const U: usize> BoundedVec<T, 1, U, witnesses::NonEmpty<1, U>> {
     }
 
     /// Creates a non-empty `BoundedVec` from an initial element and a tail `Vec`.
+    #[cfg_attr(all(test, not(debug_assertions)), no_panic::no_panic)]
     pub fn from_head_tail(first: T, mut rest: Vec<T>) -> Result<Self, BoundedVecOutOfBounds> {
-        let len = rest.len() + 1;
-        if len > U {
-            return Err(BoundedVecOutOfBounds::UpperBoundError {
-                upper_bound: U,
-                got: len,
-            });
-        }
+        let rest_len = rest.len();
+        let len = match rest_len.checked_add(1) {
+            Some(len) if len <= U => len,
+            Some(len) => {
+                return Err(BoundedVecOutOfBounds::UpperBoundError {
+                    upper_bound: U,
+                    got_larger_by: len - U,
+                });
+            }
+            None => {
+                return Err(BoundedVecOutOfBounds::UpperBoundError {
+                    upper_bound: U,
+                    got_larger_by: larger_by_after_adding(rest_len, 1, U),
+                });
+            }
+        };
         let mut inner = Vec::with_capacity(len);
         inner.push(first);
         inner.append(&mut rest);
@@ -978,6 +1107,7 @@ impl<T, const L: usize, const U: usize, W> AsRef<[T]> for BoundedVec<T, L, U, W>
     }
 }
 
+#[cfg(feature = "panic")]
 impl<T, const L: usize, const U: usize, W> AsMut<Vec<T>> for BoundedVec<T, L, U, W> {
     fn as_mut(&mut self) -> &mut Vec<T> {
         self.inner.as_mut()
@@ -1034,6 +1164,7 @@ impl<T, const L: usize, const U: usize, W, I: core::slice::SliceIndex<[T]>> core
     }
 }
 
+#[cfg(feature = "panic")]
 impl<T, const L: usize, const U: usize, W> Extend<T> for BoundedVec<T, L, U, W> {
     fn extend<Iter: IntoIterator<Item = T>>(&mut self, iter: Iter) {
         for item in iter {
@@ -1042,6 +1173,7 @@ impl<T, const L: usize, const U: usize, W> Extend<T> for BoundedVec<T, L, U, W> 
     }
 }
 
+#[cfg(feature = "panic")]
 impl<'a, T: Clone + 'a, const L: usize, const U: usize, W> Extend<&'a T>
     for BoundedVec<T, L, U, W>
 {
@@ -1325,5 +1457,20 @@ mod serde_impl {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod no_panic_tests {
+    use super::*;
+
+    #[test]
+    fn fallible_growth_does_not_panic() {
+        let mut vector = EmptyBoundedVec::<u8, 4>::with_capacity(4);
+        assert!(vector.try_push(1).is_ok());
+        assert!(vector.try_extend([2, 3]).is_ok());
+        assert!(vector.try_extend([4, 5]).is_err());
+        assert!(vector.try_insert(1, 4).is_ok());
+        assert!(vector.try_insert(0, 5).is_err());
     }
 }
